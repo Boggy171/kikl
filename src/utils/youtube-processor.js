@@ -2,7 +2,7 @@ const { execFile } = require('child_process');
 
 const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 
-// Only these values are ever passed to yt-dlp as a format
+// Onlkky these values are ever passed to yt-dlp as a format
 const QUALITY_PRESETS = {
   audio: 'bestaudio[ext=m4a]/bestaudio',
   '1080p': 'best[height<=1080][ext=mp4]/best[height<=1080]/best',
