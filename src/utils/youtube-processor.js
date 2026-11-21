@@ -45,16 +45,22 @@ const release = () => {
   if (next) next(); else running--;
 };
 
+// Optional extra flags from the YTDLP_ARGS env var (example: --js-runtimes node)
+const EXTRA_ARGS = (process.env.YTDLP_ARGS || '').split(' ').filter(Boolean);
+
 function runYtDlp(args) {
   return new Promise(async (resolve, reject) => {
     await acquire();
     execFile(
       'yt-dlp',
-      ['--no-check-certificates', '--no-warnings', '--no-playlist', ...args],
+      ['--no-check-certificates', '--no-warnings', '--no-playlist', ...EXTRA_ARGS, ...args],
       { timeout: 60000, maxBuffer: 20 * 1024 * 1024 },
-      (err, stdout) => {
+      (err, stdout, stderr) => {
         release();
-        if (err) return reject(new Error('yt-dlp failed'));
+        if (err) {
+          console.error('yt-dlp stderr:', String(stderr || err.message).slice(0, 1500));
+          return reject(new Error('yt-dlp failed'));
+        }
         resolve(stdout);
       }
     );
