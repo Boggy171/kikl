@@ -1,120 +1,102 @@
 const express = require('express');
-const https = require('https');
-const { getVideoInfo, getDownloadUrl, extractYoutubeId } = require('../utils/youtube-processor');
+const crypto = require('crypto');
+const { Readable } = require('stream');
+const {
+  extractYoutubeId, isVideoId, isQuality, getVideoInfo, getDirectUrl
+} = require('../utils/youtube-processor');
 
-const router = express.Router();
+const privateRouter = express.Router();
+const publicRouter = express.Router();
 
-// Get video formats
-router.get('/formats/:videoId', async (req, res) => {
-    try {
-        const { videoId } = req.params;
-        const url = `https://www.youtube.com/watch?v=${videoId}`;
-        const info = await getVideoInfo(url);
-        res.json(info);
-    } catch (error) {
-        console.error('Error:', error);
-        res.status(500).json({
-            error: 'Failed to get video formats',
-            message: error.message
-        });
-    }
+const TOKEN_TTL_MS = 10 * 60 * 1000;
+const QUALITIES = ['720p', '480p', '360p', 'audio'];
+
+const b64 = (buf) => Buffer.from(buf).toString('base64url');
+const sign = (data) => crypto.createHmac('sha256', process.env.API_KEY).update(data).digest('base64url');
+
+function makeToken(videoId, quality) {
+  const body = b64(JSON.stringify({ i: videoId, q: quality, e: Date.now() + TOKEN_TTL_MS }));
+  return body + '.' + sign(body);
+}
+
+function readToken(token) {
+  const [body, sig] = String(token || '').split('.');
+  if (!body || !sig) return null;
+  const good = sign(body);
+  const a = Buffer.from(sig);
+  const b = Buffer.from(good);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+  try {
+    const p = JSON.parse(Buffer.from(body, 'base64url').toString());
+    if (!p || p.e < Date.now() || !isVideoId(p.i) || !isQuality(p.q)) return null;
+    return p;
+  } catch (e) {
+    return null;
+  }
+}
+
+// POST /api/prepare  { url }  (needs X-API-Key; called by your Vercel backend only)
+privateRouter.post('/prepare', async (req, res) => {
+  try {
+    const videoId = extractYoutubeId((req.body || {}).url);
+    if (!videoId) return res.status(400).json({ error: 'Invalid YouTube link' });
+
+    const info = await getVideoInfo(videoId);
+    res.json({
+      title: info.title,
+      thumbnail: info.thumbnail,
+      duration: info.duration,
+      tokens: QUALITIES.map((q) => ({ quality: q, token: makeToken(videoId, q) }))
+    });
+  } catch (e) {
+    console.error('prepare error:', e.message);
+    res.status(502).json({ error: 'Could not fetch this video' });
+  }
 });
 
-// Download video
-router.get('/download/:videoId', async (req, res) => {
-    try {
-        const { videoId } = req.params;
-        const { quality = 'highest' } = req.query;
-        const url = `https://www.youtube.com/watch?v=${videoId}`;
-        
-        const downloadInfo = await getDownloadUrl(url, quality);
-        
-        res.json({
-            status: 'success',
-            download_url: downloadInfo.url,
-            title: downloadInfo.title,
-            ext: downloadInfo.ext,
-            quality: downloadInfo.quality,
-            thumbnail: downloadInfo.thumbnail,
-            duration: downloadInfo.duration,
-            available_qualities: [
-                'audio',
-                'highest',
-                '1080p',
-                '720p',
-                '480p',
-                '360p'
-            ]
-        });
-    } catch (error) {
-        console.error('Error:', error);
-        res.status(500).json({
-            error: 'Failed to get download URL',
-            message: error.message
-        });
-    }
+// GET /s/:token  (no header; the signed, expiring token is the auth)
+publicRouter.options('/s/:token', (req, res) => {
+  setCors(res);
+  res.status(204).end();
 });
 
-// Get video info
-router.get('/info/:videoId', async (req, res) => {
-    try {
-        const { videoId } = req.params;
-        const url = `https://www.youtube.com/watch?v=${videoId}`;
-        const info = await getVideoInfo(url);
-        res.json(info);
-    } catch (error) {
-        console.error('Error:', error);
-        res.status(500).json({
-            error: 'Failed to get video info',
-            message: error.message
-        });
+function setCors(res) {
+  const origin = process.env.SITE_ORIGIN;
+  if (origin) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Headers', 'Range');
+    res.setHeader('Access-Control-Expose-Headers', 'Content-Length, Content-Range, Accept-Ranges');
+  }
+}
+
+publicRouter.get('/s/:token', async (req, res) => {
+  const t = readToken(req.params.token);
+  if (!t) return res.status(403).json({ error: 'Link expired or invalid' });
+
+  try {
+    const url = await getDirectUrl(t.i, t.q);
+    const range = req.headers.range;
+    const upstream = await fetch(url, { headers: range ? { Range: range } : {} });
+    if (!upstream.ok && upstream.status !== 206) {
+      return res.status(502).json({ error: 'Source refused the request' });
     }
+
+    setCors(res);
+    res.status(upstream.status);
+    ['content-type', 'content-length', 'content-range', 'accept-ranges'].forEach((h) => {
+      const v = upstream.headers.get(h);
+      if (v) res.setHeader(h, v);
+    });
+    if (!upstream.body) return res.end();
+
+    const stream = Readable.fromWeb(upstream.body);
+    stream.on('error', () => res.destroy());
+    res.on('close', () => stream.destroy());
+    stream.pipe(res);
+  } catch (e) {
+    console.error('stream error:', e.message);
+    if (!res.headersSent) res.status(502).json({ error: 'Stream failed' });
+  }
 });
 
-// Stream video
-router.get('/stream/:videoId', async (req, res) => {
-    try {
-        const { videoId } = req.params;
-        const { quality = 'highest' } = req.query;
-        const url = `https://www.youtube.com/watch?v=${videoId}`;
-        
-        const downloadInfo = await getDownloadUrl(url, quality);
-        
-        // Set appropriate headers
-        res.setHeader('Content-Type', quality === 'audio' ? 'audio/mp4' : 'video/mp4');
-        res.setHeader('Content-Disposition', `attachment; filename="${downloadInfo.title}.${downloadInfo.ext}"`);
-        
-        // Create a stream from the video URL and pipe it to the response
-        https.get(downloadInfo.url, (videoStream) => {
-            videoStream.pipe(res);
-            
-            // Handle errors during streaming
-            videoStream.on('error', (error) => {
-                console.error('Stream error:', error);
-                if (!res.headersSent) {
-                    res.status(500).json({
-                        error: 'Streaming failed',
-                        message: error.message
-                    });
-                }
-            });
-        }).on('error', (error) => {
-            console.error('HTTPS request error:', error);
-            if (!res.headersSent) {
-                res.status(500).json({
-                    error: 'Failed to start stream',
-                    message: error.message
-                });
-            }
-        });
-        
-    } catch (error) {
-        console.error('Error:', error);
-        res.status(500).json({
-            error: 'Failed to stream video',
-            message: error.message
-        });
-    }
-});
-
-module.exports = router; 
+module.exports = { privateRouter, publicRouter };
