@@ -1,97 +1,95 @@
-const { exec: execCallback } = require('child_process');
-const util = require('util');
-const exec = util.promisify(execCallback);
+const { execFile } = require('child_process');
 
-// Base yt-dlp command with common options
-const YT_DLP_PATH = 'yt-dlp';
-const YT_DLP_BASE = `${YT_DLP_PATH} --no-check-certificates --no-warnings`;
+const VIDEO_ID = /^[A-Za-z0-9_-]{11}$/;
 
-// Quality presets for single format selection
+// Only these values are ever passed to yt-dlp as a format
 const QUALITY_PRESETS = {
   audio: 'bestaudio[ext=m4a]/bestaudio',
-  highest: 'best[ext=mp4]/best',
-  '1080p': 'best[height<=1080][ext=mp4]/best[height<=1080]',
-  '720p': 'best[height<=720][ext=mp4]/best[height<=720]',
-  '480p': 'best[height<=480][ext=mp4]/best[height<=480]',
-  '360p': 'best[height<=360][ext=mp4]/best[height<=360]'
+  '1080p': 'best[height<=1080][ext=mp4]/best[height<=1080]/best',
+  '720p': 'best[height<=720][ext=mp4]/best[height<=720]/best',
+  '480p': 'best[height<=480][ext=mp4]/best[height<=480]/best',
+  '360p': 'best[height<=360][ext=mp4]/best[height<=360]/best'
 };
 
-function extractYoutubeId(url) {
-  const regex = /(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/)([^"&?\/\s]{11})/;
-  const match = url.match(regex);
-  if (!match) throw new Error('Invalid YouTube URL');
-  return match[1];
-}
+const isVideoId = (id) => VIDEO_ID.test(String(id || ''));
+const isQuality = (q) => Object.prototype.hasOwnProperty.call(QUALITY_PRESETS, q);
 
-async function getVideoInfo(url) {
+// Extract the 11-char id from a YouTube URL (or return null)
+function extractYoutubeId(input) {
   try {
-    // Use system yt-dlp command with additional options
-    const { stdout, stderr } = await exec(`${YT_DLP_BASE} --format-sort quality --format best -j "${url}"`);
-    if (stderr) {
-      console.warn('yt-dlp stderr:', stderr);
+    const u = new URL(String(input));
+    const host = u.hostname.replace(/^(www\.|m\.)/, '');
+    let id = null;
+    if (host === 'youtu.be') id = u.pathname.slice(1).split('/')[0];
+    else if (host === 'youtube.com') {
+      if (u.searchParams.get('v')) id = u.searchParams.get('v');
+      else {
+        const m = u.pathname.match(/^\/(shorts|embed|live|v)\/([^/?]+)/);
+        if (m) id = m[2];
+      }
     }
-    const info = JSON.parse(stdout);
-
-    return {
-      title: info.title,
-      description: info.description,
-      duration: info.duration,
-      thumbnail: info.thumbnail,
-      formats: info.formats.map(format => ({
-        formatId: format.format_id,
-        ext: format.ext,
-        resolution: format.resolution,
-        filesize: format.filesize,
-        vcodec: format.vcodec,
-        acodec: format.acodec,
-        quality: format.quality
-      }))
-    };
-  } catch (error) {
-    console.error('Error getting video info:', error);
-    throw error;
+    return isVideoId(id) ? id : null;
+  } catch (e) {
+    return null;
   }
 }
 
-async function getDownloadUrl(videoUrl, quality = 'highest') {
-  try {
-    // Get video info first
-    const { stdout: infoStr, stderr: infoErr } = await exec(`${YT_DLP_BASE} -j "${videoUrl}"`);
-    if (infoErr) {
-      console.warn('yt-dlp info stderr:', infoErr);
-    }
-    const info = JSON.parse(infoStr);
-    
-    // Get format based on quality preset or use custom format
-    const formatArg = QUALITY_PRESETS[quality] || quality;
-    
-    // Get direct URL with merged format
-    const { stdout: urlOutput, stderr: urlErr } = await exec(`${YT_DLP_BASE} --format "${formatArg}" --get-url --no-playlist "${videoUrl}"`);
-    if (urlErr) {
-      console.warn('yt-dlp url stderr:', urlErr);
-    }
+// Max 2 yt-dlp processes at once so a free instance does not choke
+let running = 0;
+const waiting = [];
+const acquire = () => new Promise((resolve) => {
+  if (running < 2) { running++; resolve(); } else waiting.push(resolve);
+});
+const release = () => {
+  const next = waiting.shift();
+  if (next) next(); else running--;
+};
 
-    // Split URLs and get the appropriate one
-    const urls = urlOutput.trim().split('\n');
-    const downloadUrl = quality === 'audio' ? urls[0] : urls[urls.length - 1];
-
-    return {
-      url: downloadUrl,
-      title: info.title,
-      ext: quality === 'audio' ? 'm4a' : 'mp4',
-      quality: quality,
-      thumbnail: info.thumbnail,
-      duration: info.duration,
-      filesize: info.filesize
-    };
-  } catch (error) {
-    console.error('Error getting download URL:', error);
-    throw error;
-  }
+function runYtDlp(args) {
+  return new Promise(async (resolve, reject) => {
+    await acquire();
+    execFile(
+      'yt-dlp',
+      ['--no-check-certificates', '--no-warnings', '--no-playlist', ...args],
+      { timeout: 60000, maxBuffer: 20 * 1024 * 1024 },
+      (err, stdout) => {
+        release();
+        if (err) return reject(new Error('yt-dlp failed'));
+        resolve(stdout);
+      }
+    );
+  });
 }
 
-module.exports = {
-  extractYoutubeId,
-  getVideoInfo,
-  getDownloadUrl
-}; 
+const watchUrl = (id) => 'https://www.youtube.com/watch?v=' + id;
+
+async function getVideoInfo(videoId) {
+  if (!isVideoId(videoId)) throw new Error('Invalid video id');
+  const out = await runYtDlp(['-j', '--skip-download', watchUrl(videoId)]);
+  const info = JSON.parse(out);
+  return {
+    title: info.title,
+    thumbnail: info.thumbnail,
+    duration: info.duration
+  };
+}
+
+// Resolve the direct media URL (cached ~10 min so Range/seek requests are fast)
+const cache = new Map();
+async function getDirectUrl(videoId, quality) {
+  if (!isVideoId(videoId) || !isQuality(quality)) throw new Error('Invalid request');
+  const key = videoId + ':' + quality;
+  const hit = cache.get(key);
+  if (hit && hit.exp > Date.now()) return hit.url;
+
+  const out = await runYtDlp(['-f', QUALITY_PRESETS[quality], '-g', watchUrl(videoId)]);
+  const lines = out.trim().split('\n').filter(Boolean);
+  const url = quality === 'audio' ? lines[0] : lines[lines.length - 1];
+  if (!url) throw new Error('No media url');
+
+  cache.set(key, { url, exp: Date.now() + 10 * 60 * 1000 });
+  if (cache.size > 200) cache.delete(cache.keys().next().value);
+  return url;
+}
+
+module.exports = { extractYoutubeId, isVideoId, isQuality, getVideoInfo, getDirectUrl, QUALITY_PRESETS };
